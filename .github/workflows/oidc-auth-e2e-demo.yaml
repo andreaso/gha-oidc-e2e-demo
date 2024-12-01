@@ -1,0 +1,97 @@
+---
+name: OIDC authentication end-to-end demo
+
+on: push
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  oidc_auth_e2e:
+    name: Illustrate the OIDC authentication end-to-end
+    runs-on: ubuntu-24.04
+
+    # Environment variables starting with THAT_CLOUD_CONF_ are meant
+    # to simulate existing configuration on the side of the cloud
+    # provider ThatCloud.
+    env:
+      # No other issuer is applicable here.
+      THAT_CLOUD_CONF_GH_ISSUER: https://token.actions.githubusercontent.com
+
+      # The configured audience needs to match the value set in the curl request.
+      THAT_CLOUD_CONF_GH_AUDIENCE: ThatCloudIDP
+
+      # This specific configuration can be ditched completely if you decide to
+      # go ahead and modify the ThatCloud part of the workflow to instead check
+      # some other claim(s).
+      THAT_CLOUD_CONF_GH_ALLOWED_REPO: andreaso/gha-oidc-e2e-demo
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      ###
+      ###  We start of by showing what is actually happening GitHub side
+      ###
+
+      # The curl request below is conceptually the same as the
+      # requests actions such as aws-actions/configure-aws-credentials
+      # and google-github-actions/auth perform under the hood.
+      #
+      # The environment variables $ACTIONS_ID_TOKEN_REQUEST_URL and
+      # $ACTIONS_ID_TOKEN_REQUEST_TOKEN are injected into the job when
+      # the permission "id-token: write" is set.
+      - name: Have the GitHub Actions Job request an OIDC JWT token from GitHub
+        id: gha_request_jwt
+        run: |
+          response=$(curl --fail --silent --show-error \
+                      --header "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+                      "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=ThatCloudIDP")
+          jwt_token=$(echo "$response" | jq --raw-output .value)
+          echo "token=$jwt_token" >> "$GITHUB_OUTPUT"
+
+      - name: Simulate using the OIDC JWT token to request access to ThatCloud
+        env:
+          oidc_jwt_token: ${{ steps.gha_request_jwt.outputs.token }}
+        run: |
+          # curl --fail --silent --show-error \
+          #   --header "Authorization: Bearer $oidc_jwt_token" \
+          #   --json '{ "role": "BucketViewer" }' \
+          #   https://auth.thatcloud.example/
+
+
+      ###
+      ### From here on we are simulating what's happening internally
+      ### at the cloud provider ThatCloud, in response to the GitHub
+      ### Actions job making a request to the ThatCould auth endpoint,
+      ### offering up the OIDC JWT token.
+      ###
+
+      - name: Verify the OIDC JWT token sent from the GitHub Actions job
+        id: that_cloud_verify_jwt
+        env:
+          incoming_oidc_jwt_token: ${{ steps.gha_request_jwt.outputs.token }}
+        run: >
+          python3 .github/helpers/verify_oidc_jwt.py
+          "$incoming_oidc_jwt_token"
+          "$THAT_CLOUD_CONF_GH_ISSUER"
+          "$THAT_CLOUD_CONF_GH_AUDIENCE"
+
+      # In addition to the simplified authentication check below a
+      # real scenario would also include an authorization lookup,
+      # verifying the request role/identity/access.
+      - name: Compare verified claims against pre-configured condition(s)
+        env:
+          verified_claims: ${{ steps.that_cloud_verify_jwt.outputs.verified_claims }}
+        run: |
+          verified_repo=$(echo "$verified_claims" | jq --raw-output .repository)
+          if [ "$verified_repo" != "$THAT_CLOUD_CONF_GH_ALLOWED_REPO" ]; then
+              echo "You Shall Not Pass!"; exit 1
+          fi
+
+      - name: Simulate returning a short-lived auth token to the GitHub Actions job
+        run: >
+          echo
+          "Here, use '$(uuidgen)' to authenticate towards ThatCloud."
+          "It will be valid until $(date --utc --date +1hour --iso-8601=seconds)."
